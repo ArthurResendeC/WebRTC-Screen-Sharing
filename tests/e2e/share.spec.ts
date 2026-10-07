@@ -427,6 +427,15 @@ test('five participants: simultaneous publishing, reciprocal watching and two re
   await expect(remoteVideo(b)).toHaveJSProperty('muted', true);
   await b.getByRole('button', { name: 'Ligar áudio', exact: true }).click();
   await expect(remoteVideo(b)).toHaveJSProperty('muted', false);
+  const volumeSlider = b.getByRole('slider', { name: 'Volume', exact: true });
+  await volumeSlider.fill('40');
+  await expect(remoteVideo(b)).toHaveJSProperty('volume', 0.4);
+  await volumeSlider.fill('0');
+  await expect(remoteVideo(b)).toHaveJSProperty('muted', true);
+  await b.getByRole('button', { name: 'Ligar áudio', exact: true }).click();
+  await expect(remoteVideo(b)).toHaveJSProperty('muted', false);
+  await expect(remoteVideo(b)).toHaveJSProperty('volume', 0.4);
+  await expect(volumeSlider).toHaveValue('40');
 
   await expect
     .poll(() =>

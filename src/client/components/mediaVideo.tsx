@@ -14,11 +14,13 @@ import {
   ZoomInIcon,
   ZoomOutIcon,
 } from './icons';
+import { recallViewerVolume, rememberViewerVolume } from '../viewerVolume';
 
 const MIN_ZOOM = 1;
 const MAX_ZOOM = 3;
 const ZOOM_STEP = 0.25;
 const CONTROLS_IDLE_MS = 2500;
+const VOLUME_STEP = 5;
 
 type Props = { stream: MediaStream | null; label: string } & (
   | { local: true; onStopWatching?: never }
@@ -53,6 +55,8 @@ export function MediaVideo({
   } | null>(null);
   const [blocked, setBlocked] = useState(false);
   const [muted, setMuted] = useState(local);
+  const [volume, setVolume] = useState(1);
+  const [volumeSupported, setVolumeSupported] = useState(false);
   const [pipActive, setPipActive] = useState(false);
   const [fullscreenActive, setFullscreenActive] = useState(false);
   const [pipSupported, setPipSupported] = useState(false);
@@ -122,7 +126,10 @@ export function MediaVideo({
     const container = player.current;
     if (!element || !container) return;
 
-    const syncMuted = () => setMuted(element.muted);
+    const syncVolume = () => {
+      setMuted(element.muted);
+      setVolume(element.volume);
+    };
     const enterPip = () => setPipActive(true);
     const leavePip = () => setPipActive(false);
     const syncFullscreen = () =>
@@ -136,12 +143,19 @@ export function MediaVideo({
     setFullscreenSupported(
       !local && document.fullscreenEnabled && 'requestFullscreen' in container,
     );
-    element.addEventListener('volumechange', syncMuted);
+    if (!local) {
+      // iOS ignores volume writes and always reports 1; hide the slider there.
+      element.volume = 0.5;
+      setVolumeSupported(element.volume === 0.5);
+      element.volume = recallViewerVolume();
+      syncVolume();
+    }
+    element.addEventListener('volumechange', syncVolume);
     element.addEventListener('enterpictureinpicture', enterPip);
     element.addEventListener('leavepictureinpicture', leavePip);
     document.addEventListener('fullscreenchange', syncFullscreen);
     return () => {
-      element.removeEventListener('volumechange', syncMuted);
+      element.removeEventListener('volumechange', syncVolume);
       element.removeEventListener('enterpictureinpicture', enterPip);
       element.removeEventListener('leavepictureinpicture', leavePip);
       document.removeEventListener('fullscreenchange', syncFullscreen);
@@ -175,7 +189,18 @@ export function MediaVideo({
   const toggleMuted = () => {
     const element = video.current;
     if (!element) return;
+    if (element.muted && element.volume === 0)
+      element.volume = recallViewerVolume() || 1;
     element.muted = !element.muted;
+  };
+
+  const changeVolume = (percent: number) => {
+    const element = video.current;
+    if (!element) return;
+    const next = percent / 100;
+    element.volume = next;
+    element.muted = next === 0;
+    if (next > 0) rememberViewerVolume(next);
   };
 
   const constrainOffset = useCallback((x: number, y: number, scale: number) => {
@@ -271,6 +296,8 @@ export function MediaVideo({
     }
   };
 
+  const volumePercent = Math.round((muted ? 0 : volume) * 100);
+
   const stopWatching = () => {
     leavePresentationModes();
     onStopWatching?.();
@@ -363,16 +390,36 @@ export function MediaVideo({
                 <ZoomInIcon />
               </button>
             </div>
-            <button
-              type="button"
-              className={`media-control media-control-icon${muted ? ' is-active' : ''}`}
-              title={muted ? 'Ligar áudio' : 'Desligar áudio'}
-              aria-label={muted ? 'Ligar áudio' : 'Desligar áudio'}
-              aria-pressed={muted}
-              onClick={toggleMuted}
+            <div
+              className="media-volume-controls"
+              role="group"
+              aria-label="Volume do áudio"
             >
-              {muted ? <VolumeMutedIcon /> : <VolumeIcon />}
-            </button>
+              <button
+                type="button"
+                className={`media-control media-control-icon${muted ? ' is-active' : ''}`}
+                title={muted ? 'Ligar áudio' : 'Desligar áudio'}
+                aria-label={muted ? 'Ligar áudio' : 'Desligar áudio'}
+                aria-pressed={muted}
+                onClick={toggleMuted}
+              >
+                {muted ? <VolumeMutedIcon /> : <VolumeIcon />}
+              </button>
+              {volumeSupported && (
+                <input
+                  type="range"
+                  className="media-volume-slider"
+                  min={0}
+                  max={100}
+                  step={VOLUME_STEP}
+                  value={volumePercent}
+                  title="Volume"
+                  aria-label="Volume"
+                  aria-valuetext={`${volumePercent}%`}
+                  onChange={event => changeVolume(Number(event.target.value))}
+                />
+              )}
+            </div>
             {pipSupported && (
               <button
                 type="button"

@@ -200,6 +200,10 @@ export function MediaVideo({
     const next = percent / 100;
     element.volume = next;
     element.muted = next === 0;
+    // volumechange arrives after the next render: without this, the controlled
+    // slider snaps back to the old value and its change event re-applies it.
+    setVolume(next);
+    setMuted(next === 0);
     if (next > 0) rememberViewerVolume(next);
   };
 

@@ -108,6 +108,8 @@ export const clientMessageSchema = z.discriminatedUnion('type', [
       password: roomPasswordSchema.optional(),
       accessToken: roomAccessTokenSchema.optional(),
       clientId: id.optional(),
+      // Retomar o lugar guardado depois de uma queda do socket (joined.resumed).
+      resume: z.boolean().optional(),
     })
     .strict(),
   offer,
@@ -126,6 +128,8 @@ export const clientMessageSchema = z.discriminatedUnion('type', [
     })
     .strict(),
   z.object({ type: z.literal('ping') }).strict(),
+  // Saída de propósito (aba fechada ou recarregada): sem prazo de reconexão.
+  z.object({ type: z.literal('leave') }).strict(),
 ]);
 export type ClientMessage = z.infer<typeof clientMessageSchema>;
 export const serverMessageSchema = z.discriminatedUnion('type', [
@@ -145,6 +149,9 @@ export const serverMessageSchema = z.discriminatedUnion('type', [
     accessTokenExpiresAt: z.number().int().positive().nullable(),
     peerId: id,
     peers: z.array(participant).max(MAX_ROOM_MESSAGE_PARTICIPANTS),
+    // true: the server kept this client's place, sharing and subscriptions while
+    // its socket was down, and every P2P connection it had is still valid.
+    resumed: z.boolean().optional(),
   }),
   z
     .object({

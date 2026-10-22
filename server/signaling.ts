@@ -30,12 +30,25 @@ export type Client = {
   // Onde encontrar as tracks deste cliente no SFU Cloudflare (modo cloudflare).
   rtPublication?: RtPublication;
   watching: Map<string, Subscription>;
+  // Enquanto o socket caiu e a reconexão ainda pode retomar o lugar na sala
+  // (disconnect): o que chegou para este cliente nesse meio-tempo.
+  grace?: {
+    timer: ReturnType<typeof setTimeout>;
+    outbox: string[];
+    overflowed: boolean;
+  };
   alive: boolean;
   count: number;
   window: number;
   failedRoomAttempts: number;
 };
 type Room = { name: string; members: Map<string, Client> };
+
+// Quanto tempo um participante cujo socket caiu continua na sala esperando a
+// reconexão. A mídia é P2P e não depende do socket: uma queda curta do proxy ou da
+// rede não deve encerrar transmissões nem aparecer como saída e entrada.
+const RECONNECT_GRACE_MS = 20_000;
+const GRACE_OUTBOX_LIMIT = 256;
 
 export class SignalingHub {
   readonly rooms = new Map<string, Room>();
@@ -46,6 +59,7 @@ export class SignalingHub {
   constructor(
     private readonly roomTokenSecret: string,
     private readonly maxRoomParticipants?: number,
+    private readonly reconnectGraceMs = RECONNECT_GRACE_MS,
   ) {}
 
   createClient(): Client {
@@ -70,7 +84,16 @@ export class SignalingHub {
   }
 
   private send(client: Client, message: ServerMessage) {
-    if (!client.socket) return;
+    if (!client.socket) {
+      // room-state fica de fora: o joined da reconexão já traz a lista atual.
+      const grace = client.grace;
+      if (!grace || message.type === 'room-state' || message.type === 'pong')
+        return;
+      if (grace.outbox.length < GRACE_OUTBOX_LIMIT)
+        grace.outbox.push(JSON.stringify(message));
+      else grace.overflowed = true;
+      return;
+    }
     if (client.socket.getBufferedAmount() > 1024 * 1024) {
       client.socket.terminate();
       this.leave(client);
@@ -124,7 +147,26 @@ export class SignalingHub {
     }
   }
 
+  // O socket caiu: quem está numa sala ganha reconnectGraceMs para voltar com o
+  // mesmo clientId e retomar tudo (join-room); só depois disso sai de fato.
+  disconnect(client: Client) {
+    if (!client.socket) return;
+    client.socket = undefined;
+    this.clients.delete(client);
+    if (!client.roomId || !this.reconnectGraceMs) {
+      this.leave(client);
+      return;
+    }
+    client.grace = {
+      timer: setTimeout(() => this.leave(client), this.reconnectGraceMs),
+      outbox: [],
+      overflowed: false,
+    };
+  }
+
   leave(client: Client) {
+    if (client.grace) clearTimeout(client.grace.timer);
+    client.grace = undefined;
     this.clients.delete(client);
     const roomId = client.roomId;
     client.roomId = undefined;
@@ -170,6 +212,12 @@ export class SignalingHub {
     const message = parsed.data;
     if (message.type === 'ping') {
       this.send(client, { type: 'pong' });
+      return;
+    }
+    if (message.type === 'leave') {
+      const socket = client.socket;
+      this.leave(client);
+      socket?.close(1000, 'Left');
       return;
     }
     if (message.type === 'create-room') {
@@ -259,7 +307,11 @@ export class SignalingHub {
         room = { name: verified.room.roomName, members: new Map() };
         this.rooms.set(message.roomId, room);
       }
+      const previous = message.clientId
+        ? room.members.get(message.clientId)
+        : undefined;
       if (
+        !previous &&
         this.maxRoomParticipants &&
         room.members.size >= this.maxRoomParticipants
       ) {
@@ -268,26 +320,42 @@ export class SignalingHub {
         );
         return;
       }
-      // A reconnecting client reclaims its previous identity so peers can resume their
-      // subscriptions after a redeploy or network blip drops the socket. Only the
-      // originating tab ever knows its own clientId, so a collision here always means
-      // the existing member is a stale connection the heartbeat hasn't reaped yet —
-      // evict it immediately instead of leaving both entries visible as "duplicate"
-      // participants until the next heartbeat cycle.
-      if (message.clientId) {
-        const stale = room.members.get(message.clientId);
-        if (stale && stale !== client) {
-          room.members.delete(stale.id);
-          for (const sessionId of stale.watching.keys())
-            this.unsubscribe(stale, room, sessionId);
-          this.stopPublishing(stale, room);
-          this.clients.delete(stale);
-          stale.roomId = undefined;
-          stale.socket?.close(4001, 'Reconectado em outra sessão.');
-          stale.socket = undefined;
+      // A reconnecting client reclaims its previous identity. Only the originating
+      // tab ever knows its own clientId, so a member with it is this same client on
+      // a dropped socket: either waiting out its reconnect grace or a half-open
+      // connection the heartbeat hasn't reaped yet. When the client still holds its
+      // session (resume), its sharing, subscriptions and pending messages move to
+      // the new socket, so the P2P connections that kept running meanwhile stay
+      // valid and the room never sees a leave. Otherwise the stale entry is evicted.
+      let resumed = false;
+      let pending: string[] = [];
+      if (message.clientId && previous && previous !== client) {
+        const grace = previous.grace;
+        resumed = Boolean(message.resume) && !grace?.overflowed;
+        if (grace) clearTimeout(grace.timer);
+        previous.grace = undefined;
+        if (resumed) {
+          pending = grace?.outbox ?? [];
+          client.alias = previous.alias;
+          client.sharing = previous.sharing;
+          client.rtPublication = previous.rtPublication;
+          client.watching = previous.watching;
+          previous.watching = new Map();
+          previous.sharing = false;
+          previous.rtPublication = undefined;
+        } else {
+          for (const sessionId of previous.watching.keys())
+            this.unsubscribe(previous, room, sessionId);
+          this.stopPublishing(previous, room);
         }
-        client.id = message.clientId;
+        room.members.delete(previous.id);
+        this.clients.delete(previous);
+        previous.roomId = undefined;
+        const socket = previous.socket;
+        previous.socket = undefined;
+        socket?.close(4001, 'Reconectado em outra sessão.');
       }
+      if (message.clientId) client.id = message.clientId;
       client.roomId = message.roomId;
       room.members.set(client.id, client);
       this.send(client, {
@@ -299,7 +367,10 @@ export class SignalingHub {
         accessTokenExpiresAt,
         peerId: client.id,
         peers: this.participants(room),
+        resumed,
       });
+      if (client.socket)
+        for (const queued of pending) client.socket.send(queued);
       this.broadcast(room);
       return;
     }
@@ -417,8 +488,9 @@ export class SignalingHub {
   heartbeat() {
     for (const client of this.clients) {
       if (!client.alive) {
-        client.socket?.terminate();
-        this.leave(client);
+        const socket = client.socket;
+        this.disconnect(client);
+        socket?.terminate();
         continue;
       }
       client.alive = false;
@@ -430,6 +502,9 @@ export class SignalingHub {
     // 1012 = service restart: tells clients this is a redeploy, not a lost connection.
     for (const client of this.clients)
       client.socket?.close(1012, 'Server restarting');
+    for (const room of this.rooms.values())
+      for (const member of room.members.values())
+        if (member.grace) clearTimeout(member.grace.timer);
     this.clients.clear();
     this.rooms.clear();
   }

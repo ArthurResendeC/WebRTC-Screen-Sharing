@@ -219,7 +219,7 @@ const server = Bun.serve<Client>({
       hub.message(ws.data, message);
     },
     close(ws) {
-      hub.leave(ws.data);
+      hub.disconnect(ws.data);
     },
     pong(ws) {
       hub.pong(ws.data);

@@ -65,6 +65,20 @@ export function reportClientError(
   });
 }
 
+// Quedas do socket de signaling depois de entrar na sala: o código de fechamento diz
+// quem derrubou (1006 rede/proxy, 1001 proxy saindo, 1012 deploy, 4000 heartbeat).
+export function reportSignalingDrop(close: {
+  code: number;
+  reason: string;
+  openMs: number;
+}) {
+  const seconds = Math.round(close.openMs / 1000);
+  reportClientError(
+    'signaling',
+    `Signaling caiu: código ${close.code}${close.reason ? ` (${close.reason})` : ''}, aberto há ${seconds}s, aba ${document.visibilityState}, ${navigator.onLine ? 'online' : 'offline'}`,
+  );
+}
+
 // Captura: erros de carregamento de recurso não sobem até window, só são vistos na
 // fase de captura. Só script e folha de estilo: sem eles a página não monta.
 window.addEventListener(

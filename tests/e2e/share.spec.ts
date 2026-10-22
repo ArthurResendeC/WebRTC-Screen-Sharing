@@ -1,4 +1,10 @@
-import { test, expect, type Page, type BrowserContext } from '@playwright/test';
+import {
+  test,
+  expect,
+  type Page,
+  type BrowserContext,
+  type Locator,
+} from '@playwright/test';
 
 type TestWindow = Window & {
   testConnections: RTCPeerConnection[];
@@ -187,6 +193,14 @@ async function choose(viewer: Page, name: string) {
     })
     .click();
 }
+// The player's control bar hides after a few idle seconds, which a loaded machine
+// running five pages can spend before a click lands. Focus inside the player keeps
+// the bar up, so the click no longer races that timer.
+async function pressMediaControl(control: Locator) {
+  await control.focus();
+  await control.click();
+}
+
 async function playing(page: Page, color: 'red' | 'blue', audio: number) {
   await expect
     .poll(() =>
@@ -390,7 +404,9 @@ test('five participants: simultaneous publishing, reciprocal watching and two re
       bControls.evaluate(element => getComputedStyle(element).opacity),
     )
     .toBe('1');
-  await b.getByRole('button', { name: 'Aumentar zoom', exact: true }).click();
+  await pressMediaControl(
+    b.getByRole('button', { name: 'Aumentar zoom', exact: true }),
+  );
   await expect(
     b.getByRole('button', {
       name: 'Redefinir zoom, atualmente 125%',
@@ -539,10 +555,9 @@ test('five participants: simultaneous publishing, reciprocal watching and two re
   await expect(c.locator('#room-sidebar')).not.toHaveClass(/is-collapsed/);
 
   // Each live can be stopped independently while the other remains connected.
-  await c
-    .getByRole('button', { name: 'Deixar de assistir', exact: true })
-    .first()
-    .click();
+  await pressMediaControl(
+    c.getByRole('button', { name: 'Deixar de assistir', exact: true }).first(),
+  );
   await playing(c, 'blue', 0);
   await expect
     .poll(() => activeCounts(c))
@@ -561,9 +576,9 @@ test('five participants: simultaneous publishing, reciprocal watching and two re
   // C was left on B's ended screen, so B sharing again reopens it on its own.
   await shareButton(b).click();
   await playing(c, 'blue', 0);
-  await viewers[2]
-    .getByRole('button', { name: 'Deixar de assistir', exact: true })
-    .click();
+  await pressMediaControl(
+    viewers[2].getByRole('button', { name: 'Deixar de assistir', exact: true }),
+  );
   await cleared(viewers[2]);
   await expect
     .poll(() => activeCounts(viewers[2]))
@@ -638,6 +653,22 @@ const dropSignaling = (page: Page) =>
       .forEach(socket => socket.close()),
   );
 
+// The remote stream on screen is the same object across a signaling drop only if
+// the P2P connection carrying it was never torn down and renegotiated.
+const markStream = (page: Page) =>
+  remoteVideo(page).evaluate((video: HTMLVideoElement) => {
+    (window as unknown as { markedStream: unknown }).markedStream =
+      video.srcObject;
+  });
+const sameStream = (page: Page) =>
+  remoteVideo(page).evaluate(
+    (video: HTMLVideoElement) =>
+      video.srcObject ===
+      (window as unknown as { markedStream: unknown }).markedStream,
+  );
+const reconnected = (page: Page) =>
+  expect(page.getByText(/Reconectando/)).toHaveCount(0);
+
 test('a single lost signaling socket reconnects on its own and resumes sharing and watching', async ({
   page: a,
   context,
@@ -659,18 +690,21 @@ test('a single lost signaling socket reconnects on its own and resumes sharing a
   await playing(a, 'blue', 1);
   await playing(b, 'red', 1);
 
-  // B's socket drops. No button to press: B's session comes back on its own,
-  // keeps the same captured screen, and re-selects the stream B was watching.
+  // B's socket drops. No button to press: B's socket comes back on its own and
+  // the server hands back B's place, so neither stream is renegotiated.
+  await markStream(a);
+  await markStream(b);
   await dropSignaling(b);
+  await reconnected(b);
   await expect(participantCount(b)).toHaveText('2');
   await playing(b, 'red', 1);
+  expect(await sameStream(a)).toBe(true);
+  expect(await sameStream(b)).toBe(true);
   expect(
     await b.evaluate(
       () => (window as unknown as TestWindow).testTrack.readyState,
     ),
   ).toBe('live');
-  // A stayed connected and saw B leave from the ended screen; once B is back and
-  // sharing again, A picks it up without a click.
   await playing(a, 'blue', 1);
 });
 
@@ -691,16 +725,18 @@ test('a pure publisher whose socket drops keeps publishing to its viewer after r
   await choose(b, aName);
   await playing(b, 'red', 1);
 
-  // A only publishes — it is not watching anyone. Its socket drops; it must come
-  // back on its own and re-announce the same screen so B's view recovers.
+  // A only publishes — it is not watching anyone. Its socket drops and comes back
+  // on its own; B's view never stops.
+  await markStream(b);
   await dropSignaling(a);
+  await reconnected(a);
   await expect(participantCount(a)).toHaveText('2');
+  expect(await sameStream(b)).toBe(true);
   expect(
     await a.evaluate(
       () => (window as unknown as TestWindow).testTrack.readyState,
     ),
   ).toBe('live');
-  // B was left on the ended screen, so the re-announced screen reopens there.
   await playing(b, 'red', 1);
 });
 

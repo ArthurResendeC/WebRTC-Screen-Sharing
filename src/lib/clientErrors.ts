@@ -22,6 +22,7 @@ export const clientErrorReportSchema = z
       'resource',
       'render',
       'react-recoverable',
+      'signaling',
     ]),
     message: z.string().min(1).max(CLIENT_ERROR_LIMITS.message),
     stack: z.string().max(CLIENT_ERROR_LIMITS.stack).optional(),

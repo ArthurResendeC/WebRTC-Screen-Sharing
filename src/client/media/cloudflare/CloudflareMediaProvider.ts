@@ -1,4 +1,7 @@
-import { connectSignaling } from '../../../lib/signaling/client';
+import {
+  connectSignaling,
+  type SignalingClose,
+} from '../../../lib/signaling/client';
 import {
   ALIAS_MAX_LENGTH,
   type Participant,
@@ -23,6 +26,7 @@ import {
   type VideoDegradation,
   VIDEO_DEGRADATION_PREFERENCE,
 } from '../../../lib/webrtc/rtcConfiguration';
+import { reportSignalingDrop } from '../../errorReporting';
 import { displayName, participantName } from '../../participantPresentation';
 import { inviteUrl, rememberRoomAccess } from '../../roomStorage';
 import { playSound, unlockSounds } from '../../sounds';
@@ -748,11 +752,11 @@ export class CloudflareMediaProvider implements MediaProvider {
     }, delay);
   }
 
-  private teardown() {
+  private teardown(leaving = false) {
     this.joined = false;
     this.ticket = null;
     this.cfSessionId = null;
-    this.channel?.close();
+    this.channel?.close(leaving);
     this.channel = null;
     this.pc?.close();
     this.pc = null;
@@ -819,15 +823,20 @@ export class CloudflareMediaProvider implements MediaProvider {
           .then(() => this.receive(seq, message))
           .catch(() => {});
       },
-      socketState => this.onSocketState(seq, socketState),
+      (socketState, close) => this.onSocketState(seq, socketState, close),
     );
   }
 
-  private onSocketState(seq: number, socketState: string) {
+  private onSocketState(
+    seq: number,
+    socketState: string,
+    close?: SignalingClose,
+  ) {
     if (!this.isCurrent(seq)) return;
     // "connected" for the UI means the Cloudflare session is up, not just the WS —
     // establishSession() flips socketState once the PC is ready.
     if (socketState === 'connected') return;
+    if (close && this.joined) reportSignalingDrop(close);
     this.update({ socketState });
     this.joined = false;
     this.pc?.close();
@@ -1242,7 +1251,7 @@ export class CloudflareMediaProvider implements MediaProvider {
     if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.settingsTimer) clearInterval(this.settingsTimer);
     this.teardownCapture();
-    this.teardown();
+    this.teardown(true);
     this.listeners.clear();
   }
 }

@@ -728,3 +728,195 @@ test('a reconnect race evicts the stale connection instead of duplicating the pa
     hub.close();
   }
 });
+
+function graceRoom(hub: SignalingHub) {
+  const roomId = crypto.randomUUID();
+  const join = (clientId: string = crypto.randomUUID(), resume = false) => {
+    const client = hub.createClient();
+    const socket = new FakeSocket();
+    hub.open(client, socket);
+    const send = (message: unknown) =>
+      hub.message(client, JSON.stringify(authorized(message)));
+    send({
+      type: 'join-room',
+      roomId,
+      clientId,
+      ...(resume ? { resume } : {}),
+    });
+    const joined = socket.take('joined');
+    if (joined.type !== 'joined') throw new Error();
+    return { client, socket, send, clientId, joined };
+  };
+  // A sharer with one viewer subscribed to it.
+  const sharer = join();
+  sharer.send({ type: 'sharing-started' });
+  const viewer = join();
+  const sessionId = crypto.randomUUID();
+  viewer.send({ type: 'watch', targetPeerId: sharer.clientId, sessionId });
+  viewer.socket.take('watching');
+  sharer.socket.take('subscriber-joined');
+  sharer.socket.inbox.length = 0;
+  viewer.socket.inbox.length = 0;
+  return { join, sharer, viewer, sessionId };
+}
+
+const ice = (targetPeerId: string, sessionId: string) => ({
+  type: 'ice-candidate',
+  targetPeerId,
+  sessionId,
+  candidate: { candidate: 'candidate:1 1 udp 1 192.0.2.1 9 typ host' },
+});
+
+test('a dropped socket keeps its place, sharing and subscriptions until it resumes', () => {
+  const hub = new SignalingHub(ROOM_SECRET);
+  try {
+    const { join, sharer, viewer, sessionId } = graceRoom(hub);
+
+    hub.disconnect(sharer.client);
+    // The room sees nothing: the P2P connection to the viewer keeps running.
+    expect(viewer.socket.inbox).toHaveLength(0);
+    // Signals sent meanwhile wait for the sharer instead of being dropped.
+    viewer.send(ice(sharer.clientId, sessionId));
+
+    const back = join(sharer.clientId, true);
+    expect(back.joined).toMatchObject({
+      resumed: true,
+      peerId: sharer.clientId,
+    });
+    if (back.joined.type !== 'joined') throw new Error();
+    expect(back.joined.peers).toHaveLength(2);
+    expect(
+      back.joined.peers.find(peer => peer.peerId === sharer.clientId)?.sharing,
+    ).toBeTrue();
+    expect(back.socket.take('ice-candidate')).toMatchObject({
+      peerId: viewer.clientId,
+      sessionId,
+    });
+
+    // The subscription moved to the new socket: relaying still works both ways.
+    back.send(ice(viewer.clientId, sessionId));
+    expect(viewer.socket.take('ice-candidate')).toMatchObject({
+      peerId: sharer.clientId,
+    });
+    expect(viewer.socket.inbox.map(message => message.type)).not.toContain(
+      'subscription-ended',
+    );
+
+    // The old socket's belated close is a no-op.
+    hub.disconnect(sharer.client);
+    hub.leave(sharer.client);
+    expect(viewer.socket.inbox.map(message => message.type)).not.toContain(
+      'subscription-ended',
+    );
+  } finally {
+    hub.close();
+  }
+});
+
+test('a resumed client does not count twice against the room cap', () => {
+  const hub = new SignalingHub(ROOM_SECRET, 2);
+  try {
+    const { join, sharer } = graceRoom(hub);
+    hub.disconnect(sharer.client);
+    expect(join(sharer.clientId, true).joined).toMatchObject({ resumed: true });
+  } finally {
+    hub.close();
+  }
+});
+
+test('the reconnect grace expires into a normal leave', async () => {
+  const hub = new SignalingHub(ROOM_SECRET, undefined, 5);
+  try {
+    const { join, sharer, viewer, sessionId } = graceRoom(hub);
+    hub.disconnect(sharer.client);
+    await Bun.sleep(20);
+    expect(viewer.socket.take('subscription-ended')).toEqual({
+      type: 'subscription-ended',
+      peerId: sharer.clientId,
+      sessionId,
+    });
+    const state = viewer.socket.take('room-state');
+    if (state.type !== 'room-state') throw new Error();
+    expect(state.peers.map(peer => peer.peerId)).toEqual([viewer.clientId]);
+
+    const back = join(sharer.clientId, true);
+    expect(back.joined).toMatchObject({
+      resumed: false,
+      peerId: sharer.clientId,
+    });
+  } finally {
+    hub.close();
+  }
+});
+
+test('a reconnect whose pending messages overflowed starts over', () => {
+  const hub = new SignalingHub(ROOM_SECRET);
+  try {
+    const { join, sharer, viewer, sessionId } = graceRoom(hub);
+    hub.disconnect(sharer.client);
+    for (let i = 0; i < 300; i++) {
+      // Stay under the per-second rate limit.
+      viewer.client.count = 0;
+      viewer.send(ice(sharer.clientId, sessionId));
+    }
+    const back = join(sharer.clientId, true);
+    expect(back.joined).toMatchObject({ resumed: false });
+    expect(back.socket.inbox.map(message => message.type)).not.toContain(
+      'ice-candidate',
+    );
+    expect(viewer.socket.take('subscription-ended')).toMatchObject({
+      peerId: sharer.clientId,
+      sessionId,
+    });
+  } finally {
+    hub.close();
+  }
+});
+
+test('a socket reaped by the heartbeat also gets the reconnect grace', () => {
+  const hub = new SignalingHub(ROOM_SECRET);
+  try {
+    const { join, sharer, viewer } = graceRoom(hub);
+    hub.heartbeat();
+    hub.pong(viewer.client);
+    hub.heartbeat();
+    expect(sharer.socket.closed).toBeTrue();
+    expect(viewer.socket.inbox.map(message => message.type)).toEqual([]);
+    expect(join(sharer.clientId, true).joined).toMatchObject({ resumed: true });
+  } finally {
+    hub.close();
+  }
+});
+
+test('a rejoin that does not ask to resume evicts the dropped entry', () => {
+  const hub = new SignalingHub(ROOM_SECRET);
+  try {
+    const { join, sharer, viewer, sessionId } = graceRoom(hub);
+    hub.disconnect(sharer.client);
+    expect(join(sharer.clientId).joined).toMatchObject({ resumed: false });
+    expect(viewer.socket.take('subscription-ended')).toMatchObject({
+      peerId: sharer.clientId,
+      sessionId,
+    });
+  } finally {
+    hub.close();
+  }
+});
+
+test('an explicit leave skips the reconnect grace', () => {
+  const hub = new SignalingHub(ROOM_SECRET);
+  try {
+    const { sharer, viewer, sessionId } = graceRoom(hub);
+    sharer.send({ type: 'leave' });
+    expect(sharer.socket.closed).toBeTrue();
+    expect(viewer.socket.take('subscription-ended')).toMatchObject({
+      peerId: sharer.clientId,
+      sessionId,
+    });
+    const state = viewer.socket.take('room-state');
+    if (state.type !== 'room-state') throw new Error();
+    expect(state.peers.map(peer => peer.peerId)).toEqual([viewer.clientId]);
+  } finally {
+    hub.close();
+  }
+});

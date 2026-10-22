@@ -1,7 +1,8 @@
-import { connectSignaling } from '../lib/signaling/client';
+import { connectSignaling, type SignalingClose } from '../lib/signaling/client';
 import {
   ALIAS_MAX_LENGTH,
   MAX_WATCHED_STREAMS,
+  type ClientMessage,
   type Participant,
   type ServerMessage,
 } from '../lib/signaling/messages';
@@ -51,6 +52,7 @@ import type {
   Selection,
 } from './media/types';
 import { ACCENTS } from './media/types';
+import { reportSignalingDrop } from './errorReporting';
 import { displayName, participantName } from './participantPresentation';
 import { inviteUrl, rememberRoomAccess } from './roomStorage';
 import { playSound, unlockSounds } from './sounds';
@@ -70,7 +72,13 @@ type Session = {
   joined: boolean;
   membersSeeded: boolean;
   codecPreference: VideoCodecPreference;
+  // Não nulo enquanto o socket caiu depois de entrar na sala: a sessão (peers,
+  // transmissão, seleções) continua viva e o que seria enviado espera aqui até a
+  // reconexão confirmar que o servidor guardou o lugar (joined.resumed).
+  outbox: ClientMessage[] | null;
 };
+
+const OUTBOX_LIMIT = 256;
 
 type Listener = () => void;
 
@@ -174,7 +182,7 @@ export class ScreenShareController implements MediaProvider {
     const session = this.session;
     if (!session?.joined || session.disposed) return;
     try {
-      session.channel?.send({ type: 'set-alias', alias });
+      this.send(session, { type: 'set-alias', alias });
     } catch {
       // Reconnection sends it again.
     }
@@ -247,7 +255,7 @@ export class ScreenShareController implements MediaProvider {
 
   reconnect() {
     this.reconnectAttempts = 0;
-    this.startSession();
+    this.reconnectSession();
   }
 
   dismissJoinError() {
@@ -318,7 +326,7 @@ export class ScreenShareController implements MediaProvider {
         error: '',
       });
       try {
-        session.channel!.send({
+        this.send(session, {
           type: 'watch',
           targetPeerId: null,
           sessionId: current.sessionId,
@@ -352,7 +360,7 @@ export class ScreenShareController implements MediaProvider {
     });
     try {
       session.peers.select(peerId, sessionId);
-      session.channel!.send({ type: 'watch', targetPeerId: peerId, sessionId });
+      this.send(session, { type: 'watch', targetPeerId: peerId, sessionId });
       if (!resuming) playSound('viewer-join');
     } catch (error) {
       session.peers.removeSession(sessionId);
@@ -515,6 +523,16 @@ export class ScreenShareController implements MediaProvider {
     this.update({ error });
   }
 
+  // Envia pelo socket ou, com ele caído, guarda para a reconexão (Session.outbox).
+  private send(session: Session, message: ClientMessage) {
+    if (session.outbox) {
+      if (session.outbox.length < OUTBOX_LIMIT) session.outbox.push(message);
+      return;
+    }
+    if (!session.channel) throw new Error('Signaling desconectado.');
+    session.channel.send(message);
+  }
+
   private isCurrent(session: Session) {
     return this.session === session && !session.disposed;
   }
@@ -576,7 +594,7 @@ export class ScreenShareController implements MediaProvider {
     }
     if (notify && session.joined) {
       try {
-        session.channel?.send({ type: 'sharing-stopped' });
+        this.send(session, { type: 'sharing-stopped' });
       } catch {
         // Signaling disconnect also ends publication.
       }
@@ -611,7 +629,7 @@ export class ScreenShareController implements MediaProvider {
     session.codecPreference = this.activeCodecPreference;
     this.adoptStream(session, captured);
     try {
-      session.channel?.send({ type: 'sharing-started' });
+      this.send(session, { type: 'sharing-started' });
     } catch {
       // Rejoining announces it again.
     }
@@ -650,7 +668,7 @@ export class ScreenShareController implements MediaProvider {
     session.disposed = true;
     this.detachPublishing(session);
     session.peers.closeAllPeers();
-    session.channel?.close();
+    session.channel?.close(true);
     session.channel = null;
   }
 
@@ -663,7 +681,7 @@ export class ScreenShareController implements MediaProvider {
       return;
     if (document.visibilityState === 'hidden') return;
     this.reconnectAttempts = 0;
-    this.startSession();
+    this.reconnectSession();
   };
 
   private scheduleReconnect() {
@@ -673,8 +691,16 @@ export class ScreenShareController implements MediaProvider {
     this.reconnectAttempts++;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = undefined;
-      this.startSession();
+      this.reconnectSession();
     }, delay);
+  }
+
+  // Uma sessão suspensa (socket caído depois de entrar) só reabre o socket; o resto
+  // começa do zero.
+  private reconnectSession() {
+    const session = this.session;
+    if (session?.outbox && this.isCurrent(session)) this.openChannel(session);
+    else this.startSession();
   }
 
   private startSession() {
@@ -721,16 +747,9 @@ export class ScreenShareController implements MediaProvider {
       endedPeerId: null,
       inviteCopied: false,
     });
-    let queue = Promise.resolve();
     const holder: { session?: Session } = {};
-    const reportError = (error: unknown) => {
-      if (holder.session && this.isCurrent(holder.session))
-        this.setError(
-          error instanceof Error ? error.message : 'Falha na conexão WebRTC.',
-        );
-    };
     const peers = new Peers(
-      message => holder.session!.channel!.send(message),
+      message => this.send(holder.session!, message),
       (sessionId, peerId, stream) => {
         if (!holder.session || !this.isCurrent(holder.session)) return;
         const remoteStreams = this.state.remoteStreams.filter(
@@ -743,7 +762,7 @@ export class ScreenShareController implements MediaProvider {
         if (holder.session && this.isCurrent(holder.session))
           this.renderPeerState(peers);
       },
-      reportError,
+      error => this.reportError(holder.session!, error),
     );
     const session: Session = {
       peers,
@@ -756,9 +775,34 @@ export class ScreenShareController implements MediaProvider {
       joined: false,
       membersSeeded: false,
       codecPreference: 'auto',
+      outbox: null,
     };
     holder.session = session;
     this.session = session;
+    this.openChannel(session);
+  }
+
+  private reportError(session: Session, error: unknown) {
+    if (this.isCurrent(session))
+      this.setError(
+        error instanceof Error ? error.message : 'Falha na conexão WebRTC.',
+      );
+  }
+
+  private openChannel(session: Session) {
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
+    this.reconnectTimer = undefined;
+    if (navigator.onLine === false) {
+      // Suspensa: o evento online reabre o socket.
+      this.update({
+        socketState: 'disconnected',
+        error:
+          'Você está offline. A conexão será retomada quando a internet voltar.',
+      });
+      return;
+    }
+    if (session.outbox) this.update({ socketState: 'connecting' });
+    let queue = Promise.resolve();
     try {
       session.channel = connectSignaling(
         this.roomId,
@@ -769,42 +813,67 @@ export class ScreenShareController implements MediaProvider {
         message => {
           queue = queue
             .then(() => this.receive(session, message))
-            .catch(reportError);
+            .catch(error => this.reportError(session, error));
         },
-        socketState => this.onSocketState(session, socketState),
+        (socketState, close) => this.onSocketState(session, socketState, close),
+        session.outbox !== null,
       );
     } catch (error) {
-      reportError(error);
+      this.reportError(session, error);
       this.update({ socketState: 'error' });
       if (!this.disposed) this.scheduleReconnect();
     }
   }
 
-  private onSocketState(session: Session, socketState: string) {
+  private onSocketState(
+    session: Session,
+    socketState: string,
+    close?: SignalingClose,
+  ) {
     if (!this.isCurrent(session)) return;
     this.update({ socketState });
     if (socketState === 'connected') return;
+    const suspend = session.joined || session.outbox !== null;
+    if (close && session.joined) reportSignalingDrop(close);
     session.joined = false;
+    session.channel?.close();
+    session.channel = null;
+    if (suspend && !this.disposed && !this.accessTerminal) {
+      // A mídia é P2P e segue sem o socket: mantém peers, transmissão e seleções
+      // e só reabre o socket. O servidor guarda o lugar por alguns segundos.
+      session.outbox ??= [];
+      this.setError(
+        socketState === 'restarting'
+          ? 'Nova versão publicada. Reconectando à sala…'
+          : 'Conexão com a sala perdida. Reconectando… as transmissões continuam.',
+      );
+      this.scheduleReconnect();
+      return;
+    }
+    this.resetSession(session);
+    session.disposed = true;
+    if (this.disposed || this.accessTerminal) return;
+    this.setError('Conexão perdida. Reconectando à sala…');
+    this.scheduleReconnect();
+  }
+
+  // Desfaz tudo que dependia do lugar na sala; o joined seguinte refaz a partir de
+  // localStream e watchTargets (resumeAfterReconnect).
+  private resetSession(session: Session) {
+    session.outbox = null;
     if (this.watchTargets.size) this.resumeWatch = true;
     this.detachPublishing(session);
     session.peers.closeAllPeers();
     session.selections.clear();
     session.members = [];
-    session.disposed = true;
-    session.channel?.close();
+    // The next joined seeds the list silently, as a fresh session would.
+    session.membersSeeded = false;
     this.update({
       selfId: '',
       selectedIds: [],
       members: [],
       remoteStreams: [],
     });
-    if (this.disposed || this.accessTerminal) return;
-    this.setError(
-      socketState === 'restarting'
-        ? 'Nova versão publicada. Reconectando à sala…'
-        : 'Conexão perdida. Reconectando à sala…',
-    );
-    this.scheduleReconnect();
   }
 
   private updateMembers(session: Session, next: Participant[]) {
@@ -837,7 +906,16 @@ export class ScreenShareController implements MediaProvider {
   private async receive(session: Session, message: ServerMessage) {
     if (!this.isCurrent(session) || !session.channel) return;
     switch (message.type) {
-      case 'joined':
+      case 'joined': {
+        // Sem resumed o servidor recomeçou sem este cliente (reinício, ou a queda
+        // passou do prazo): as conexões P2P mantidas não valem mais.
+        const resumed =
+          session.outbox !== null &&
+          message.resumed === true &&
+          message.peerId === this.state.selfId;
+        const pending = resumed ? (session.outbox ?? []) : [];
+        if (session.outbox && !resumed) this.resetSession(session);
+        session.outbox = null;
         session.joined = true;
         this.reconnectAttempts = 0;
         this.roomAccessToken = message.accessToken ?? undefined;
@@ -861,10 +939,13 @@ export class ScreenShareController implements MediaProvider {
         });
         this.updateMembers(session, message.peers);
         if (this.state.alias)
-          session.channel.send({ type: 'set-alias', alias: this.state.alias });
-        this.resumeAfterReconnect(session, message.peers);
+          this.send(session, { type: 'set-alias', alias: this.state.alias });
+        if (resumed) this.resumeSession(session, message.peers, pending);
+        else this.resumeAfterReconnect(session, message.peers);
         break;
+      }
       case 'room-access-denied':
+        if (session.outbox) this.resetSession(session);
         this.accessTerminal = message.reason === 'too-many-attempts';
         this.update({ accessError: message.reason });
         break;
@@ -913,6 +994,8 @@ export class ScreenShareController implements MediaProvider {
         }
         break;
       case 'error':
+        // Recusado ao voltar (sala cheia, por exemplo): o lugar não existe mais.
+        if (session.outbox) this.resetSession(session);
         this.update(
           session.joined
             ? { error: message.message }
@@ -924,6 +1007,23 @@ export class ScreenShareController implements MediaProvider {
       default:
         if (session.joined) await session.peers.receive(message);
     }
+  }
+
+  // O servidor guardou o lugar: entrega o que ficou pendente e acerta a transmissão
+  // se ela terminou enquanto o socket estava fora.
+  private resumeSession(
+    session: Session,
+    peers: Participant[],
+    pending: ClientMessage[],
+  ) {
+    for (const message of pending) this.send(session, message);
+    const announced = peers.some(
+      peer => peer.peerId === this.state.selfId && peer.sharing,
+    );
+    if (announced && !session.stream)
+      this.send(session, { type: 'sharing-stopped' });
+    else if (!announced && session.stream)
+      this.send(session, { type: 'sharing-started' });
   }
 
   private resumeAfterReconnect(session: Session, peers: Participant[]) {

@@ -39,7 +39,8 @@ O processo deve iniciar a partir da raiz; o script `start` entra em `dist` para 
 5. Qualquer participante pode clicar em **Compartilhar tela** e escolher tela, janela ou aba. Marque áudio no seletor quando disponível.
 6. Escolha uma pessoa que esteja transmitindo na barra lateral ou no seletor de telas. Trocar a seleção fecha a recepção anterior.
 7. O preview local permanece sem som. O vídeo remoto não é silenciado; se o navegador bloquear autoplay com áudio, clique em **Reproduzir vídeo e áudio**.
-8. O botão nativo de parar captura, **Parar compartilhamento**, fechar a aba ou perder o signaling encerram tracks e conexões relacionadas.
+8. O botão nativo de parar captura, **Parar compartilhamento** ou fechar a aba encerram tracks e conexões relacionadas.
+9. Uma queda curta do signaling (rede, proxy) não interrompe nada: a mídia é P2P e continua, o servidor guarda o lugar de quem caiu por 20 s e a reconexão automática o retoma, sem saída e entrada na sala. Passado esse prazo, ou depois de um deploy, a sala é refeita do zero.
 
 ## Instalação como aplicativo
 
